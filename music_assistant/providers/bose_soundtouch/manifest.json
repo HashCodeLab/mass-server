@@ -1,0 +1,12 @@
+{
+    "domain": "bose_soundtouch",
+    "name": "Bose SoundTouch",
+    "type": "player",
+    "version": "0.1.0",
+    "stage": "beta",
+    "description": "Bose SoundTouch Player provider for Music Assistant. Based on the bosesoundtouchapi python library.",
+    "requirements": ["bosesoundtouchapi>=1.0.87","websocket-client==1.6.4"],
+    "codeowners": ["@hashcodelab"],
+    "config_flow": true,
+    "mdns_discovery": ["_soundtouch._tcp.local."]
+}
