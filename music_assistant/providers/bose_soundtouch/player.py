@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from xml.etree.ElementTree import Element
 
 from bosesoundtouchapi import SoundTouchClient, SoundTouchDevice, SoundTouchNotifyCategorys
-from bosesoundtouchapi.models import NowPlayingStatus, Volume
+from bosesoundtouchapi.models import NowPlayingStatus, Volume, Zone, ZoneMember
 from bosesoundtouchapi.ws import SoundTouchWebSocket
 from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature
 from music_assistant_models.errors import MusicAssistantError
@@ -160,6 +160,24 @@ class BoseSoundTouchPlayer(Player):
                 f"Failed to pause media on player {self.player_id}: {exc}"
             ) from exc
 
+    async def next_track(self) -> None:
+        """Handle NEXT command on the player."""
+        try:
+            self._client.MediaNextTrack()
+        except Exception as exc:
+            raise MusicAssistantError(
+                f"Failed to play next track on player {self.player_id}: {exc}"
+            ) from exc
+
+    async def previous_track(self) -> None:
+        """Handle PREVIOUS command on the player."""
+        try:
+            self._client.MediaPreviousTrack()
+        except Exception as exc:
+            raise MusicAssistantError(
+                f"Failed to play previous track on player {self.player_id}: {exc}"
+            ) from exc
+
     async def seek(self, position: float) -> None:
         """Handle SEEK command on the player."""
         try:
@@ -211,6 +229,112 @@ class BoseSoundTouchPlayer(Player):
         except Exception as exc:
             self.logger.error("Error selecting source %s: %s", source, exc)
 
+    async def set_members(
+        self,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        """Handle SET_MEMEBERS command on the player."""
+        player_ids_to_add = player_ids_to_add or []
+        player_ids_to_remove = player_ids_to_remove or []
+        soundtouch_player_ids_to_add = {x for x in player_ids_to_add if not x.startswith("ap")}
+        soundtouch_player_ids_to_remove = {
+            x for x in player_ids_to_remove if not x.startswith("ap")
+        }
+        if soundtouch_player_ids_to_add or soundtouch_player_ids_to_remove:
+            self.logger.debug(
+                "Setting group members, adding: %s, removing: %s",
+                soundtouch_player_ids_to_add,
+                soundtouch_player_ids_to_remove,
+            )
+            try:
+                zone_state = self._client.GetZoneStatus()
+                self.logger.debug("Current zone state: %s", zone_state)
+
+                members_to_add = []
+                members_to_remove = []
+
+                for player_id in soundtouch_player_ids_to_add:
+                    if zone_state.MasterDeviceId:  # If current player is master add them as ZoneMember else as SoundTouchDevice
+                        members_to_add.append(ZoneMember(deviceId=player_id))
+                    else:
+                        player = self.mass.players.get_player(player_id)
+                        if player is None:
+                            return
+                        ip_address = player.device_info.ip_address
+                        members_to_add.append(SoundTouchDevice(host=ip_address))
+
+                for player_id in soundtouch_player_ids_to_remove:
+                    members_to_remove.append(ZoneMember(deviceId=player_id))
+
+                if (
+                    zone_state.MasterDeviceId is None and members_to_add
+                ):  # if no zone exists create a new zone else add members to existing zone
+                    self._client.CreateZoneFromDevices(self._soundtouchdevice, members_to_add)
+                else:
+                    if members_to_add:
+                        self._client.AddZoneMembers(members_to_add)
+                    if members_to_remove:
+                        self._client.RemoveZoneMembers(members_to_remove)
+
+            except Exception as exc:
+                self.logger.error("Error getting zone status: %s", exc)
+                return
+
+    async def ungroup(self) -> None:
+        """Handle UNGROUP command on the player."""
+        try:
+            self._client.RemoveZone()
+        except Exception as exc:
+            self.logger.error("Error ungrouping player: %s", exc)
+
+    async def on_unload(self) -> None:
+        """Handle unload of the player."""
+        if self._socket:
+            self._socket.StopNotification()
+            self._socket.ClearListeners()
+            self._socket = None
+
+        try:
+            self._client.MediaStop()
+        except Exception as exc:
+            self.logger.warning("Error stopping player: %s", exc)
+
+    def _set_attributes(self) -> None:
+        """Update/set (dynamic) properties."""
+        # set volume information
+        volume_info = None
+        try:
+            volume_info = self._client.GetVolume()
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to retrieve volume information for player %s: %s", self.player_id, exc
+            )
+        if isinstance(volume_info, Volume):
+            self._attr_volume_level = volume_info.Actual
+            self._attr_volume_muted = volume_info.IsMuted
+
+        # set source list
+        self._attr_source_list = self._get_source_list()
+
+        # update initial now playing info
+        try:
+            now_playing_status = self._client.GetNowPlayingStatus()
+            self._update_now_playing_info(now_playing_status)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to retrieve now playing information for player %s: %s", self.player_id, exc
+            )
+
+        # update initial zone members state
+        try:
+            zone_state = self._client.GetZoneStatus()
+            self._update_zone_state(zone_state)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to retrieve zone information for player %s: %s", self.player_id, exc
+            )
+
     def _get_source_list(self) -> list[PlayerSource]:
         """Return list of available (native) sources for this player."""
         sources = []
@@ -239,22 +363,12 @@ class BoseSoundTouchPlayer(Player):
             )
         return sources
 
-    def _set_attributes(self) -> None:
-        """Update/set (dynamic) properties."""
-        # set volume information
-        volume_info = None
-        try:
-            volume_info = self._client.GetVolume()
-        except Exception as exc:
-            self.logger.warning(
-                "Failed to retrieve volume information for player %s: %s", self.player_id, exc
-            )
-        if isinstance(volume_info, Volume):
-            self._attr_volume_level = volume_info.Actual
-            self._attr_volume_muted = volume_info.IsMuted
-
-        # set source list
-        self._attr_source_list = self._get_source_list()
+    def _update_zone_state(self, zone_state: Zone) -> None:
+        """Update zone state information."""
+        if zone_state.MasterDeviceId == self._soundtouchdevice.DeviceId:
+            self._attr_group_members = [member.DeviceId for member in zone_state.Members]
+        else:
+            self._attr_group_members = []
 
         self.update_state()
 
@@ -337,7 +451,7 @@ class BoseSoundTouchPlayer(Player):
 
     def _handle_websocket_notification(self, client: SoundTouchClient, args: list[Element]) -> None:
         """Handle incoming websocket notifications."""
-        if not args or len(args) == 0:
+        if not args:
             return
 
         element = args[0]
@@ -370,6 +484,18 @@ class BoseSoundTouchPlayer(Player):
             except Exception as exc:
                 self.logger.warning(
                     "Failed to parse volume information from WebSocket notification for player %s: %s",
+                    self.player_id,
+                    exc,
+                )
+
+        # update zone information on zone notifications
+        elif getattr(element, "tag", None) == "zone":
+            try:
+                zone_state = Zone(root=element)
+                self.mass.loop.call_soon_threadsafe(self._update_zone_state, zone_state)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to parse zone information from WebSocket notification for player %s: %s",
                     self.player_id,
                     exc,
                 )
