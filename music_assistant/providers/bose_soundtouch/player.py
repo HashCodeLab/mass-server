@@ -439,6 +439,8 @@ class BoseSoundTouchPlayer(Player):
 
         try:
             self._socket = SoundTouchWebSocket(self._client, pingInterval=60)
+            self._socket.AddListener(SoundTouchNotifyCategorys.WebSocketClose, self._on_ws_close)
+            self._socket.AddListener(SoundTouchNotifyCategorys.WebSocketError, self._on_ws_error)
             self._socket.AddListener(
                 SoundTouchNotifyCategorys.ALL, self._handle_websocket_notification
             )
@@ -448,6 +450,16 @@ class BoseSoundTouchPlayer(Player):
             self.logger.warning(
                 "Failed to establish WebSocket connection for player %s: %s", self.player_id, exc
             )
+
+    def _on_ws_close(self, client: SoundTouchClient, ex: Exception) -> None:
+        """Handle websocket close event."""
+        self._attr_available = False
+        self.update_state()
+
+    def _on_ws_error(self, client: SoundTouchClient, ex: Exception) -> None:
+        """Handle websocket error event."""
+        self._attr_available = False
+        self.update_state()
 
     def _handle_websocket_notification(self, client: SoundTouchClient, args: list[Element]) -> None:
         """Handle incoming websocket notifications."""
