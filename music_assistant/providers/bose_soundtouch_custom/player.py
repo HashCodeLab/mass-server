@@ -739,6 +739,13 @@ class BoseSoundTouchPlayer(Player):
             self._socket.AddListener(
                 SoundTouchNotifyCategorys.productcechdmicontrol, self._on_product_hdmi_updated
             )
+            self._socket.AddListener(
+                SoundTouchNotifyCategorys.nowPlayingUpdated, self._on_now_playing_updated
+            )
+            self._socket.AddListener(
+                SoundTouchNotifyCategorys.volumeUpdated, self._on_volume_updated
+            )
+            self._socket.AddListener(SoundTouchNotifyCategorys.zoneUpdated, self._on_zone_updated)
             self._socket.StartNotification()
             self.logger.debug("WebSocket connection established for player %s", self.player_id)
             self._connected = True
