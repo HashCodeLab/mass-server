@@ -6,9 +6,10 @@ Based on the bosesoundtouchapi library.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from bosesoundtouchapi import SoundTouchDevice
+from music_assistant_models.enums import IdentifierType
 from zeroconf import ServiceStateChange
 
 from music_assistant.constants import (
@@ -60,38 +61,67 @@ class BoseSoundTouchPlayerProvider(PlayerProvider):
         self, name: str, state_change: ServiceStateChange, info: AsyncServiceInfo | None
     ) -> None:
         """Handle mDNS service state changes."""
-        if state_change != ServiceStateChange.Added or info is None:
+        if info is None or info.type != "_soundtouch._tcp.local.":
             return
 
-        if info.type != "_soundtouch._tcp.local.":
-            return
+        if state_change == ServiceStateChange.Added:
+            ip_address = get_primary_ip_address_from_zeroconf(info)
+            if ip_address is None:
+                self.logger.warning(
+                    "Could not determine IP address for Bose SoundTouch device %s",
+                    name,
+                )
+                return
 
-        ip_address = get_primary_ip_address_from_zeroconf(info)
-        if ip_address is None:
-            self.logger.warning(
-                "Could not determine IP address for Bose SoundTouch device %s",
-                name,
+            player_id = extract_player_id(info)
+            if player_id is None:
+                self.logger.warning(
+                    "Could not extract player ID from mDNS name %s for Bose SoundTouch device",
+                    name,
+                )
+                return
+
+            # setup soundtouch device and player
+            try:
+                soundtouchdevice = SoundTouchDevice(host=ip_address, port=info.port or 8090)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to connect to Bose SoundTouch device %s at %s: %s",
+                    name,
+                    ip_address,
+                    exc,
+                )
+                return
+
+            bose_soundtouch_player = BoseSoundTouchPlayer(
+                self, player_id, soundtouchdevice, ip_address, info
             )
-            return
 
-        player_id = extract_player_id(info)
-        if player_id is None:
-            self.logger.warning(
-                "Could not extract player ID from mDNS name %s for Bose SoundTouch device",
-                name,
-            )
-            return
+        if state_change == ServiceStateChange.Updated:
+            player_id = extract_player_id(info)
+            if player_id is None:
+                self.logger.warning(
+                    "Could not extract player ID from mDNS name %s for Bose SoundTouch device",
+                    name,
+                )
+                return
 
-        # setup soundtouch device and player
-        try:
-            soundtouchdevice = SoundTouchDevice(host=ip_address, port=info.port or 8090)
-        except Exception as exc:
-            self.logger.warning(
-                "Failed to connect to Bose SoundTouch device %s at %s: %s",
-                name,
-                ip_address,
-                exc,
-            )
-            return
+            player = self.mass.players.get_player(player_id)
+            if player is None:
+                return
 
-        BoseSoundTouchPlayer(self, player_id, soundtouchdevice, ip_address, info)
+            bose_soundtouch_player = cast("BoseSoundTouchPlayer", player)
+            ip_address = get_primary_ip_address_from_zeroconf(info)
+            if ip_address is None:
+                self.logger.warning(
+                    "Could not determine IP address for Bose SoundTouch device %s",
+                    name,
+                )
+                return
+            if ip_address and ip_address != bose_soundtouch_player.device_info.ip_address:
+                bose_soundtouch_player.device_info.add_identifier(
+                    IdentifierType.IP_ADDRESS, ip_address
+                )
+            if not bose_soundtouch_player._connected and ip_address:
+                bose_soundtouch_player.reconnect()
+            self.mass.players.trigger_player_update(player_id)

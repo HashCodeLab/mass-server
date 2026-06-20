@@ -4,19 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 from xml.etree.ElementTree import Element
 
 from bosesoundtouchapi import SoundTouchClient, SoundTouchDevice, SoundTouchNotifyCategorys
-from bosesoundtouchapi.models import NowPlayingStatus, Volume, Zone, ZoneMember
+from bosesoundtouchapi.models import NowPlayingStatus, Preset, Volume, Zone, ZoneMember
 from bosesoundtouchapi.ws import SoundTouchWebSocket
-from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.enums import ConfigEntryType, MediaType, PlaybackState, PlayerFeature
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.player import DeviceInfo, PlayerSource
 
 from music_assistant.models.player import Player, PlayerMedia
 
+from .helpers import (
+    MEDIA_TYPE_OPTIONS,
+    PRESET_IDS,
+    _build_media_options,
+    _media_type_from_config,
+    _str,
+)
+
 if TYPE_CHECKING:
+    from music_assistant_models.media_items import MediaItemType
     from zeroconf.asyncio import AsyncServiceInfo
 
     from .provider import BoseSoundTouchPlayerProvider
@@ -42,6 +52,7 @@ class BoseSoundTouchPlayer(Player):
         self._socket: SoundTouchWebSocket | None = None
         self._caps = self._client.GetCapabilities()
         self._ws_supported: bool = self._caps is not None and self._caps.IsWebSocketApiProxyCapable
+        self._connected: bool = False
         self._attr_name = self._soundtouchdevice.DeviceName
         self._attr_available = True
         self._attr_supported_features = {
@@ -77,6 +88,10 @@ class BoseSoundTouchPlayer(Player):
         if self._ws_supported:
             self.mass.loop.create_task(self._initialize_websocket())
 
+    async def on_config_updated(self) -> None:
+        """Handle logic when the PlayerConfig is first loaded or updated."""
+        await self._apply_presets_to_device()
+
     @property
     def needs_poll(self) -> bool:
         """Return if the player needs to be polled for updates."""
@@ -86,6 +101,118 @@ class BoseSoundTouchPlayer(Player):
     def poll_interval(self) -> int:
         """Return the interval in seconds to poll the player for state updates."""
         return 5 if self._attr_playback_state == PlaybackState.PLAYING else 30
+
+    async def get_config_entries(
+        self, action: str | None = None, values: dict[str, ConfigValueType] | None = None
+    ) -> list[ConfigEntry]:
+        """Return all (provider/player specific) Config Entries for the player."""
+        entries = []
+
+        # implement selection for soundtouch preset buttons
+        for preset_id in PRESET_IDS:
+            media_type_key = f"preset_{preset_id}_media_type"
+            search_key = f"preset_{preset_id}_search"
+            selected_key = f"preset_{preset_id}_selected"
+            media_key = f"preset_{preset_id}_media"
+
+            search_action = f"preset_{preset_id}_do_search"
+            copy_action = f"preset_{preset_id}_copy"
+
+            values_dict = cast("dict[str, Any]", values or {})
+            media_type = _media_type_from_config(values_dict, media_type_key)
+            query = _str(values_dict, search_key)
+            selected_media = _str(values_dict, selected_key)
+            media_value = _str(values_dict, media_key)
+
+            # action execute
+            if action == copy_action and selected_media:
+                media_value = selected_media
+
+            # Dropdown options
+            media_options = await _build_media_options(
+                mass=self.mass,
+                media_type=media_type,
+                query=query,
+                selected_media=selected_media,
+                refresh=action in (search_action, copy_action),
+            )
+
+            show_results = bool(media_options)
+
+            # divider
+            entries.append(
+                ConfigEntry(
+                    key=f"preset_{preset_id}_header",
+                    type=ConfigEntryType.DIVIDER,
+                    label=f"Preset {preset_id}",
+                    required=False,
+                )
+            )
+
+            # Media type
+            entries.append(
+                ConfigEntry(
+                    key=media_type_key,
+                    type=ConfigEntryType.STRING,
+                    label=f"Preset {preset_id} Media type",
+                    options=MEDIA_TYPE_OPTIONS,
+                    value=media_type.value,
+                )
+            )
+
+            # Searchfield
+            entries.append(
+                ConfigEntry(
+                    key=search_key,
+                    type=ConfigEntryType.STRING,
+                    label=f"Preset {preset_id} Search",
+                    value=query,
+                )
+            )
+
+            # Search button
+            entries.append(
+                ConfigEntry(
+                    key=f"preset_{preset_id}_search_btn",
+                    type=ConfigEntryType.ACTION,
+                    label=f"Search Preset {preset_id}",
+                    action=search_action,
+                )
+            )
+
+            # Dropdown with results
+            if show_results:
+                entries.append(
+                    ConfigEntry(
+                        key=selected_key,
+                        type=ConfigEntryType.STRING,
+                        label=f"Preset {preset_id} Result",
+                        options=media_options,
+                        value=selected_media,
+                    )
+                )
+
+                # Copy button
+                entries.append(
+                    ConfigEntry(
+                        key=f"preset_{preset_id}_copy_btn",
+                        type=ConfigEntryType.ACTION,
+                        label=f"Take Preset {preset_id}",
+                        action=copy_action,
+                    )
+                )
+
+            # Final uri
+            entries.append(
+                ConfigEntry(
+                    key=media_key,
+                    type=ConfigEntryType.STRING,
+                    label=f"Preset {preset_id} URI",
+                    value=media_value,
+                )
+            )
+
+        return list(entries)
 
     async def power(self, powered: bool) -> None:
         """Handle POWER command on the player."""
@@ -300,6 +427,15 @@ class BoseSoundTouchPlayer(Player):
         except Exception as exc:
             self.logger.warning("Error stopping player: %s", exc)
 
+    def reconnect(self) -> None:
+        """Handle reconnect if play is back online."""
+        self._attr_available = True
+        self.update_state()
+
+        # reconnect websocket
+        if self._ws_supported:
+            self.mass.loop.create_task(self._initialize_websocket())
+
     def _set_attributes(self) -> None:
         """Update/set (dynamic) properties."""
         # set volume information
@@ -432,6 +568,51 @@ class BoseSoundTouchPlayer(Player):
 
         self.update_state()
 
+    async def _apply_presets_to_device(self) -> None:
+        """Write all configured presets to the SoundTouch device."""
+        if not hasattr(self, "_client") or self._client is None:
+            self.logger.error("SoundTouch API client not initialized")
+            return
+
+        for preset_id in range(1, 7):
+            ma_uri_raw = self.config.get_value(f"preset_{preset_id}_media")
+            ma_uri: str = str(ma_uri_raw)
+
+            if not ma_uri:
+                self.logger.info("Preset %s has no media configured, skipping", preset_id)
+                continue
+
+            now = int(time.time())
+            media = await self.mass.music.get_item_by_uri(ma_uri)
+
+            preset = Preset(
+                presetId=preset_id,
+                createdOn=now,
+                updatedOn=now,
+                source="DEFAULT",
+                typeValue="uri",
+                location=ma_uri,
+                sourceAccount="",
+                isPresetable=True,
+                name=getattr(media, "title", getattr(media, "name", "")),
+                containerArt=getattr(media, "image_url", None),
+            )
+
+            try:
+                self.logger.info("Writing SoundTouch preset %s: %s", preset_id, ma_uri)
+                await self.mass.loop.run_in_executor(None, self._client.StorePreset, preset)
+            except Exception as err:
+                self.logger.error("Failed to write preset %s: %s", preset_id, err)
+
+    async def _handle_preset_button(self, preset_info: Preset) -> None:
+        """Handle preset button press event."""
+        media = await self.mass.music.get_item_by_uri(preset_info.Location)
+        media_item = cast("MediaItemType", media)
+        await self.mass.player_queues.play_media(
+            queue_id=self.player_id,
+            media=media_item,
+        )
+
     async def _initialize_websocket(self) -> None:
         """Initialize websocket connection to receive real-time updates from the device."""
         if not self._ws_supported:
@@ -442,10 +623,18 @@ class BoseSoundTouchPlayer(Player):
             self._socket.AddListener(SoundTouchNotifyCategorys.WebSocketClose, self._on_ws_close)
             self._socket.AddListener(SoundTouchNotifyCategorys.WebSocketError, self._on_ws_error)
             self._socket.AddListener(
-                SoundTouchNotifyCategorys.ALL, self._handle_websocket_notification
+                SoundTouchNotifyCategorys.nowSelectionUpdated, self._on_now_selection_updated
             )
+            self._socket.AddListener(
+                SoundTouchNotifyCategorys.nowPlayingUpdated, self._on_now_playing_updated
+            )
+            self._socket.AddListener(
+                SoundTouchNotifyCategorys.volumeUpdated, self._on_volume_updated
+            )
+            self._socket.AddListener(SoundTouchNotifyCategorys.zoneUpdated, self._on_zone_updated)
             self._socket.StartNotification()
             self.logger.debug("WebSocket connection established for player %s", self.player_id)
+            self._connected = True
         except Exception as exc:
             self.logger.warning(
                 "Failed to establish WebSocket connection for player %s: %s", self.player_id, exc
@@ -454,60 +643,62 @@ class BoseSoundTouchPlayer(Player):
     def _on_ws_close(self, client: SoundTouchClient, ex: Exception) -> None:
         """Handle websocket close event."""
         self._attr_available = False
+        self._connected = False
         self.update_state()
 
     def _on_ws_error(self, client: SoundTouchClient, ex: Exception) -> None:
         """Handle websocket error event."""
         self._attr_available = False
+        self._connected = False
         self.update_state()
 
-    def _handle_websocket_notification(self, client: SoundTouchClient, args: list[Element]) -> None:
-        """Handle incoming websocket notifications."""
-        if not args:
-            return
+    def _on_now_selection_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
+        """Handle websocket nowSelection event."""
+        # play preset on preset notification
+        if getattr(args[0], "tag", None) == "preset":
+            preset_info = Preset(root=args[0])
+            self.mass.loop.call_soon_threadsafe(
+                asyncio.create_task, self._handle_preset_button(preset_info)
+            )
 
-        element = args[0]
+    def _on_now_playing_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
+        """Handle websocket nowPlaying event."""
+        try:
+            now_playing_status = NowPlayingStatus(root=args[0])
+            self.mass.loop.call_soon_threadsafe(self._update_now_playing_info, now_playing_status)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to parse now playing status from WebSocket notification for player %s: %s",
+                self.player_id,
+                exc,
+            )
 
-        # update now playing information on nowPlaying notifications
-        if getattr(element, "tag", None) == "nowPlaying":
-            try:
-                now_playing_status = NowPlayingStatus(root=element)
-                self.mass.loop.call_soon_threadsafe(
-                    self._update_now_playing_info, now_playing_status
-                )
-            except Exception as exc:
-                self.logger.warning(
-                    "Failed to parse now playing status from WebSocket notification for player %s: %s",
-                    self.player_id,
-                    exc,
-                )
+    def _on_volume_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
+        """Handle websocket volume event."""
+        try:
+            volume_info = Volume(root=args[0])
 
-        # update volume information on volume notifications
-        elif getattr(element, "tag", None) == "volume":
-            try:
-                volume_info = Volume(root=element)
+            def _update_volume() -> None:
+                self._attr_volume_level = getattr(volume_info, "Actual", None)
+                self._attr_volume_muted = getattr(volume_info, "IsMuted", None)
+                self.update_state()
 
-                def _update_volume() -> None:
-                    self._attr_volume_level = getattr(volume_info, "Actual", None)
-                    self._attr_volume_muted = getattr(volume_info, "IsMuted", None)
-                    self.update_state()
+            self.mass.loop.call_soon_threadsafe(_update_volume)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to parse volume information from WebSocket notification for player %s: %s",
+                self.player_id,
+                exc,
+            )
 
-                self.mass.loop.call_soon_threadsafe(_update_volume)
-            except Exception as exc:
-                self.logger.warning(
-                    "Failed to parse volume information from WebSocket notification for player %s: %s",
-                    self.player_id,
-                    exc,
-                )
-
-        # update zone information on zone notifications
-        elif getattr(element, "tag", None) == "zone":
-            try:
-                zone_state = Zone(root=element)
-                self.mass.loop.call_soon_threadsafe(self._update_zone_state, zone_state)
-            except Exception as exc:
-                self.logger.warning(
-                    "Failed to parse zone information from WebSocket notification for player %s: %s",
-                    self.player_id,
-                    exc,
-                )
+    def _on_zone_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
+        """Handle websocket zone event."""
+        try:
+            zone_state = Zone(root=args[0])
+            self.mass.loop.call_soon_threadsafe(self._update_zone_state, zone_state)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to parse zone information from WebSocket notification for player %s: %s",
+                self.player_id,
+                exc,
+            )
