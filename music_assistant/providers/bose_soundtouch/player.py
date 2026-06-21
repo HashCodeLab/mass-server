@@ -8,7 +8,15 @@ from typing import TYPE_CHECKING, Any, cast
 from xml.etree.ElementTree import Element
 
 from bosesoundtouchapi import SoundTouchClient, SoundTouchDevice, SoundTouchNotifyCategorys
-from bosesoundtouchapi.models import NowPlayingStatus, Preset, Volume, Zone, ZoneMember
+from bosesoundtouchapi.models import (
+    NowPlayingStatus,
+    Preset,
+    ProductCecHdmiControl,
+    ProductCecHdmiModes,
+    Volume,
+    Zone,
+    ZoneMember,
+)
 from bosesoundtouchapi.ws import SoundTouchWebSocket
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, MediaType, PlaybackState, PlayerFeature
@@ -21,6 +29,7 @@ from .helpers import (
     MEDIA_TYPE_OPTIONS,
     PRESET_IDS,
     _build_media_options,
+    _get_hdmi_cec_modes_options,
     _media_type_from_config,
     _str,
 )
@@ -91,6 +100,7 @@ class BoseSoundTouchPlayer(Player):
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
         await self._apply_presets_to_device()
+        await self._set_hdmi_cec_mode()
 
     @property
     def needs_poll(self) -> bool:
@@ -144,7 +154,8 @@ class BoseSoundTouchPlayer(Player):
                 ConfigEntry(
                     key=f"preset_{preset_id}_header",
                     type=ConfigEntryType.DIVIDER,
-                    label=f"Preset {preset_id}",
+                    translation_key="preset_header",
+                    translation_params=[str(preset_id)],
                     required=False,
                 )
             )
@@ -154,9 +165,11 @@ class BoseSoundTouchPlayer(Player):
                 ConfigEntry(
                     key=media_type_key,
                     type=ConfigEntryType.STRING,
-                    label=f"Preset {preset_id} Media type",
+                    translation_key="preset_media_type",
+                    translation_params=[str(preset_id)],
                     options=MEDIA_TYPE_OPTIONS,
                     value=media_type.value,
+                    required=False,
                 )
             )
 
@@ -165,8 +178,10 @@ class BoseSoundTouchPlayer(Player):
                 ConfigEntry(
                     key=search_key,
                     type=ConfigEntryType.STRING,
-                    label=f"Preset {preset_id} Search",
+                    translation_key="preset_search",
+                    translation_params=[str(preset_id)],
                     value=query,
+                    required=False,
                 )
             )
 
@@ -175,7 +190,8 @@ class BoseSoundTouchPlayer(Player):
                 ConfigEntry(
                     key=f"preset_{preset_id}_search_btn",
                     type=ConfigEntryType.ACTION,
-                    label=f"Search Preset {preset_id}",
+                    translation_key="preset_search_button",
+                    translation_params=[str(preset_id)],
                     action=search_action,
                 )
             )
@@ -186,9 +202,11 @@ class BoseSoundTouchPlayer(Player):
                     ConfigEntry(
                         key=selected_key,
                         type=ConfigEntryType.STRING,
-                        label=f"Preset {preset_id} Result",
+                        translation_key="preset_search_result",
+                        translation_params=[str(preset_id)],
                         options=media_options,
                         value=selected_media,
+                        required=False,
                     )
                 )
 
@@ -197,7 +215,8 @@ class BoseSoundTouchPlayer(Player):
                     ConfigEntry(
                         key=f"preset_{preset_id}_copy_btn",
                         type=ConfigEntryType.ACTION,
-                        label=f"Take Preset {preset_id}",
+                        translation_key="preset_take_button",
+                        translation_params=[str(preset_id)],
                         action=copy_action,
                     )
                 )
@@ -207,8 +226,32 @@ class BoseSoundTouchPlayer(Player):
                 ConfigEntry(
                     key=media_key,
                     type=ConfigEntryType.STRING,
-                    label=f"Preset {preset_id} URI",
+                    translation_key="preset_uri",
+                    translation_params=[str(preset_id)],
                     value=media_value,
+                    required=False,
+                )
+            )
+
+        # implement hdmi cec control setting
+        if self._caps.IsProductCecHdmiControlCapable:
+            entries.append(
+                ConfigEntry(
+                    key="hdmi_settings_header",
+                    type=ConfigEntryType.DIVIDER,
+                    translation_key="hdmi_settings",
+                    required=False,
+                )
+            )
+            await self._get_current_hdmi_cec_mode()
+            entries.append(
+                ConfigEntry(
+                    key="hdmi_cec_mode",
+                    type=ConfigEntryType.STRING,
+                    options=_get_hdmi_cec_modes_options(),
+                    translation_key="hdmi_cec_mode",
+                    # value=curr_hdmi_cec_mode,
+                    required=False,
                 )
             )
 
@@ -576,6 +619,8 @@ class BoseSoundTouchPlayer(Player):
 
         for preset_id in range(1, 7):
             ma_uri_raw = self.config.get_value(f"preset_{preset_id}_media")
+            if not ma_uri_raw:
+                return
             ma_uri: str = str(ma_uri_raw)
 
             if not ma_uri:
@@ -603,6 +648,27 @@ class BoseSoundTouchPlayer(Player):
                 await self.mass.loop.run_in_executor(None, self._client.StorePreset, preset)
             except Exception as err:
                 self.logger.error("Failed to write preset %s: %s", preset_id, err)
+
+    async def _get_current_hdmi_cec_mode(self) -> ProductCecHdmiModes:
+        """Get current HDMI cec mode from device."""
+        hdmi_cec_mode = (None,)
+        try:
+            hdmi_cec_mode = self._client.GetProductCecHdmiControl()
+            hdmi_cec_mode = ProductCecHdmiModes(hdmi_cec_mode.CecMode).value
+            self.config.update({"hdmi_cec_mode": hdmi_cec_mode})
+        except Exception as err:
+            self.logger.warning("Failed to get current hdmi cec mode: %s", err)
+
+        return hdmi_cec_mode
+
+    async def _set_hdmi_cec_mode(self) -> None:
+        """Set HDMI CEC mode on device."""
+        try:
+            hdmi_cec_control = ProductCecHdmiControl()
+            hdmi_cec_control.CecMode = self.config.get_value("hdmi_cec_mode")
+            self._client.SetProductCecHdmiControl(hdmi_cec_control)
+        except Exception as err:
+            self.logger.error("Failed to set hdmi cec mode: %s", err)
 
     async def _handle_preset_button(self, preset_info: Preset) -> None:
         """Handle preset button press event."""
@@ -632,6 +698,9 @@ class BoseSoundTouchPlayer(Player):
                 SoundTouchNotifyCategorys.volumeUpdated, self._on_volume_updated
             )
             self._socket.AddListener(SoundTouchNotifyCategorys.zoneUpdated, self._on_zone_updated)
+            self._socket.AddListener(
+                SoundTouchNotifyCategorys.productcechdmicontrol, self._on_product_hdmi_updated
+            )
             self._socket.StartNotification()
             self.logger.debug("WebSocket connection established for player %s", self.player_id)
             self._connected = True
@@ -699,6 +768,20 @@ class BoseSoundTouchPlayer(Player):
         except Exception as exc:
             self.logger.warning(
                 "Failed to parse zone information from WebSocket notification for player %s: %s",
+                self.player_id,
+                exc,
+            )
+
+    def _on_product_hdmi_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
+        """Handle websocket product hdmi event."""
+        try:
+            hdmi_cec_state = ProductCecHdmiControl(root=args[0])
+            self.mass.loop.call_soon_threadsafe(
+                self.config.update, {"hdmi_cec_mode": hdmi_cec_state.CecMode}
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to parse producthdmi information from WebSocket notification for player %s: %s",
                 self.player_id,
                 exc,
             )

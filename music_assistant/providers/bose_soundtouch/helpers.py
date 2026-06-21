@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
+from bosesoundtouchapi.models.productcechdmimodes import ProductCecHdmiModes
 from music_assistant_models.config_entries import ConfigValueOption
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import MusicAssistantError
@@ -102,7 +103,7 @@ async def _search_media(
             ),
             timeout=SEARCH_TIMEOUT,
         )
-    except (MusicAssistantError, TimeoutError):
+    except MusicAssistantError, TimeoutError:
         return []
 
     match media_type:
@@ -138,3 +139,17 @@ def _media_type_from_config(
         return mt if mt in SEARCHABLE_MEDIA_TYPES else default
     except ValueError:
         return default
+
+
+def _get_hdmi_cec_modes_options() -> list[ConfigValueOption]:
+    options: list[ConfigValueOption] = []
+
+    for member in ProductCecHdmiModes:
+        options.append(
+            ConfigValueOption(
+                title=member.name.replace("_", " ").title(),
+                value=member.value,
+            )
+        )
+
+    return sorted(options, key=lambda o: (o.title or "").lower())
