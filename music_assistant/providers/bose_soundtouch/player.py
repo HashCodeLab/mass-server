@@ -9,6 +9,7 @@ from xml.etree.ElementTree import Element
 
 from bosesoundtouchapi import SoundTouchClient, SoundTouchDevice, SoundTouchNotifyCategorys
 from bosesoundtouchapi.models import (
+    AudioDspControls,
     NowPlayingStatus,
     Preset,
     ProductCecHdmiControl,
@@ -21,7 +22,7 @@ from bosesoundtouchapi.ws import SoundTouchWebSocket
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, MediaType, PlaybackState, PlayerFeature
 from music_assistant_models.errors import MusicAssistantError
-from music_assistant_models.player import DeviceInfo, PlayerSource
+from music_assistant_models.player import DeviceInfo, PlayerSoundMode, PlayerSource
 
 from music_assistant.models.player import Player, PlayerMedia
 
@@ -74,6 +75,7 @@ class BoseSoundTouchPlayer(Player):
             PlayerFeature.SET_MEMBERS,
             PlayerFeature.VOLUME_MUTE,
             PlayerFeature.VOLUME_SET,
+            PlayerFeature.SELECT_SOUND_MODE,
         }
         device_info = DeviceInfo(
             model=self._soundtouchdevice.DeviceType,
@@ -451,6 +453,18 @@ class BoseSoundTouchPlayer(Player):
                 self.logger.error("Error getting zone status: %s", exc)
                 return
 
+    async def select_sound_mode(self, sound_mode: str) -> None:
+        """Handle sound mode command."""
+        if not self._caps.IsAudioDspControlsCapable:
+            return
+
+        try:
+            audio_dsp_controls = AudioDspControls()
+            audio_dsp_controls.AudioMode = sound_mode
+            self._client.SetAudioDspControls(audio_dsp_controls)
+        except Exception as exc:
+            self.logger.error("Error setting audio mode: %s", exc)
+
     async def ungroup(self) -> None:
         """Handle UNGROUP command on the player."""
         try:
@@ -495,6 +509,9 @@ class BoseSoundTouchPlayer(Player):
 
         # set source list
         self._attr_source_list = self._get_source_list()
+
+        # set sound modes
+        self._attr_sound_mode_list = self._get_sound_modes_list()
 
         # update initial now playing info
         try:
@@ -541,6 +558,33 @@ class BoseSoundTouchPlayer(Player):
                 "Failed to retrieve source list for player %s: %s", self.player_id, exc
             )
         return sources
+
+    def _get_sound_modes_list(self) -> list[PlayerSoundMode]:
+        """Return list of available (native) sound modes for this player."""
+        if not self._caps.IsAudioDspControlsCapable:
+            return []
+
+        sound_modes = []
+        try:
+            audio_dsp_controls = self._client.GetAudioDspControls()
+            available_sound_modes = audio_dsp_controls.SupportedAudioModes.split("|")
+            for mode in available_sound_modes:
+                mode_id = mode
+                mode_name = mode.replace("_", " ").title()
+
+                sound_modes.append(PlayerSoundMode(id=mode_id, name=mode_name))
+            self._update_sound_mode(audio_dsp_controls)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to retrieve sound mode list for player %s: %s", self.player_id, exc
+            )
+
+        return sound_modes
+
+    def _update_sound_mode(self, sound_mode: AudioDspControls) -> None:
+        """Update audio mode information."""
+        self._attr_active_sound_mode = sound_mode.AudioMode
+        self.update_state()
 
     def _update_zone_state(self, zone_state: Zone) -> None:
         """Update zone state information."""
@@ -663,6 +707,8 @@ class BoseSoundTouchPlayer(Player):
 
     async def _set_hdmi_cec_mode(self) -> None:
         """Set HDMI CEC mode on device."""
+        if not self._caps.IsProductCecHdmiControlCapable:
+            return
         try:
             hdmi_cec_control = ProductCecHdmiControl()
             hdmi_cec_control.CecMode = self.config.get_value("hdmi_cec_mode")
@@ -688,6 +734,9 @@ class BoseSoundTouchPlayer(Player):
             self._socket = SoundTouchWebSocket(self._client, pingInterval=60)
             self._socket.AddListener(SoundTouchNotifyCategorys.WebSocketClose, self._on_ws_close)
             self._socket.AddListener(SoundTouchNotifyCategorys.WebSocketError, self._on_ws_error)
+            self._socket.AddListener(
+                SoundTouchNotifyCategorys.audiodspcontrols, self._on_audio_dsp_controls_updated
+            )
             self._socket.AddListener(
                 SoundTouchNotifyCategorys.nowSelectionUpdated, self._on_now_selection_updated
             )
@@ -720,6 +769,19 @@ class BoseSoundTouchPlayer(Player):
         self._attr_available = False
         self._connected = False
         self.update_state()
+
+    def _on_audio_dsp_controls_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
+        """Handle audio dsp controls event."""
+        try:
+            audio_dsp_controls = AudioDspControls(root=args[0])
+
+            self.mass.loop.call_soon_threadsafe(self._update_sound_mode, audio_dsp_controls)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to parse volume information from WebSocket notification for player %s: %s",
+                self.player_id,
+                exc,
+            )
 
     def _on_now_selection_updated(self, client: SoundTouchClient, args: list[Element]) -> None:
         """Handle websocket nowSelection event."""
