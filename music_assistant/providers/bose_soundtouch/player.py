@@ -364,28 +364,17 @@ class BoseSoundTouchPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle playing media on the player."""
-        url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
-        # Test if play media method works on the device
         try:
-            self._client.PlayUrl(
-                url=url,
+            media_url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
+            self._client.PlayUrlDlna(
+                url=media_url,
                 artist=media.artist or "",
-                album=media.album or "",
-                track=media.title or "",
+                album=media.album,
+                track=media.title,
+                artUrl=media.image_url or None,
             )
-        except Exception as exc:
-            self.logger.debug("Error playing media with play url method: %s", exc)
-            # Fallback to select source UPNP
-            try:
-                self._client.PlayUrlDlna(
-                    url=url,
-                    artist=media.artist or "",
-                    album=media.album or "",
-                    track=media.title or "",
-                    artUrl=media.image_url or None,
-                )
-            except Exception as exc2:
-                self.logger.error("Error playing media with DLNA method: %s", exc2)
+        except Exception as exc2:
+            self.logger.error("Error playing media with DLNA method: %s", exc2)
 
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
