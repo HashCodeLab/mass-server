@@ -1,5 +1,5 @@
 {
-    "domain": "bose_soundtouch",
+    "domain": "bose_soundtouch_custom",
     "name": "Bose SoundTouch",
     "type": "player",
     "version": "0.1.0",
